@@ -1,4 +1,4 @@
-name: Flashback x86→ARM Repack
+name: Build Flashback ARM FFmpeg Fix
 on: [push, workflow_dispatch]
 
 jobs:
@@ -15,49 +15,136 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Build normally
-        run: ./gradlew build
-
-      - name: Repack JAR — x86 libs → ARM64
+      - name: Patch Flashback — JAVE2 → PojavLauncher FFmpeg APK
         run: |
-          JAR=$(find build/libs -name "flashback-*.jar" \
-                ! -name "*-dev*" ! -name "*-sources*" | head -1)
+          python3 - << 'EOF'
+          import re, os, glob
 
-          mkdir -p repack
-          cd repack
-          cp "../$JAR" original.jar
+          # ── Step 1: JAVE2 remove ─────────────────────────────────────
+          for f in ["build.gradle", "build.gradle.kts"]:
+              if not os.path.exists(f): continue
+              with open(f) as fp:
+                  g = fp.read()
+              g = re.sub(r'[^\n]*ws\.schild:jave[^\n]*\n', '', g)
+              with open(f, "w") as fp:
+                  fp.write(g)
+              print(f"✅ JAVE2 removed from {f}")
 
-          # JAR extract karo
-          unzip -q original.jar -d extracted
+          # ── Step 2: FFmpeg wrapper inject ────────────────────────────
+          wrapper_dir = "src/main/java/com/moulberry/flashback/ffmpeg"
+          os.makedirs(wrapper_dir, exist_ok=True)
 
-          # x86 .so files dhundo aur ARM64 se replace karo
-          find extracted -name "*.so" | while read so; do
-            echo "Found native lib: $so"
-            # x86_64 → aarch64 path rename
-            arm_path="${so//x86_64/aarch64}"
-            arm_path="${arm_path//x86/aarch64}"
-            if [ "$so" != "$arm_path" ]; then
-              mkdir -p "$(dirname "$arm_path")"
-              mv "$so" "$arm_path"
-              echo "  Renamed → $arm_path"
-            fi
-          done
+          wrapper_code = '''package com.moulberry.flashback.ffmpeg;
 
-          # JAVE2 x86 jar ke andar bhi native libs hoti hain
-          find extracted -name "*.jar" | while read innerjar; do
-            if unzip -l "$innerjar" | grep -q "x86"; then
-              echo "Inner JAR has x86 libs: $innerjar — removing"
-              rm "$innerjar"
-            fi
-          done
+import net.minecraft.client.MinecraftClient;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
 
-          # Repack karo
-          cd extracted
-          zip -q -r "../../build/libs/flashback-arm64-repack.jar" .
-          echo "✅ ARM64 JAR ready"
+public class ExternalFFmpegEncoder {
 
-      - name: Upload ARM64 JAR
+    private Process ffmpegProcess;
+    private OutputStream stdin;
+
+    private static final String[] FFMPEG_PATHS = {
+        // PojavLauncher FFmpeg APK (net.kdt.pojavlaunch.ffmpeg)
+        "/data/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
+        "/data/data/net.kdt.pojavlaunch.ffmpeg/cache/ffmpeg",
+        "/sdcard/Android/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
+        // Fallback paths
+        "/data/data/net.kdt.pojavlaunch/files/ffmpeg",
+        "/data/data/net.kdt.pojavlaunch.debug/files/ffmpeg",
+        "/system/bin/ffmpeg",
+        "ffmpeg"
+    };
+
+    public static String findFFmpegBinary() {
+        for (String path : FFMPEG_PATHS) {
+            File f = new File(path);
+            if (f.exists() && f.canExecute()) {
+                System.out.println("[Flashback] FFmpeg found: " + f.getAbsolutePath());
+                return f.getAbsolutePath();
+            }
+        }
+        System.err.println("[Flashback] FFmpeg not found! Install net.kdt.pojavlaunch.ffmpeg APK");
+        return null;
+    }
+
+    public boolean start(String outputPath, int width, int height, int fps, int bitrate) {
+        String ffmpeg = findFFmpegBinary();
+        if (ffmpeg == null) return false;
+
+        List<String> cmd = Arrays.asList(
+            ffmpeg,
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", width + "x" + height,
+            "-r", String.valueOf(fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-b:v", bitrate + "k",
+            "-pix_fmt", "yuv420p",
+            outputPath
+        );
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            ffmpegProcess = pb.start();
+            stdin = ffmpegProcess.getOutputStream();
+
+            new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(ffmpegProcess.getInputStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null)
+                        System.out.println("[FFmpeg] " + line);
+                } catch (IOException ignored) {}
+            }).start();
+
+            return true;
+        } catch (IOException e) {
+            System.err.println("[Flashback] FFmpeg start failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public void writeFrame(byte[] rgbData) throws IOException {
+        if (stdin != null) stdin.write(rgbData);
+    }
+
+    public void finish() throws IOException, InterruptedException {
+        if (stdin != null) stdin.close();
+        if (ffmpegProcess != null) ffmpegProcess.waitFor();
+    }
+}
+'''
+          with open(f"{wrapper_dir}/ExternalFFmpegEncoder.java", "w") as f:
+              f.write(wrapper_code)
+          print("✅ ExternalFFmpegEncoder.java created")
+
+          # ── Step 3: JAVE2 calls replace karo ────────────────────────
+          for fp in glob.glob("src/main/java/**/*.java", recursive=True):
+              with open(fp) as f:
+                  code = f.read()
+              if "jave" not in code.lower(): continue
+
+              code = re.sub(
+                  r'import ws\.schild\.jave[^;]+;',
+                  'import com.moulberry.flashback.ffmpeg.ExternalFFmpegEncoder;',
+                  code
+              )
+              with open(fp, "w") as f:
+                  f.write(code)
+              print(f"✅ Patched: {fp}")
+          EOF
+
+      - name: Build
+        run: ./gradlew build --stacktrace
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: flashback-arm64-repack
-          path: build/libs/flashback-arm64-repack.jar
+          name: flashback-arm-fixed
+          path: build/libs/flashback-*.jar
