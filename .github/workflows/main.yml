@@ -15,12 +15,78 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Patch Flashback — JAVE2 → PojavLauncher FFmpeg APK
+      - name: Write FFmpeg wrapper Java file
         run: |
-          python3 - << 'EOF'
+          mkdir -p src/main/java/com/moulberry/flashback/ffmpeg
+          cat > src/main/java/com/moulberry/flashback/ffmpeg/ExternalFFmpegEncoder.java << JAVAEOF
+          package com.moulberry.flashback.ffmpeg;
+          import net.minecraft.client.MinecraftClient;
+          import java.io.*;
+          import java.util.*;
+          public class ExternalFFmpegEncoder {
+              private Process ffmpegProcess;
+              private OutputStream stdin;
+              private static final String[] FFMPEG_PATHS = {
+                  "/data/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
+                  "/data/data/net.kdt.pojavlaunch.ffmpeg/cache/ffmpeg",
+                  "/sdcard/Android/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
+                  "/data/data/net.kdt.pojavlaunch/files/ffmpeg",
+                  "/system/bin/ffmpeg",
+                  "ffmpeg"
+              };
+              public static String findFFmpegBinary() {
+                  for (String path : FFMPEG_PATHS) {
+                      File f = new File(path);
+                      if (f.exists() && f.canExecute()) {
+                          System.out.println("[Flashback] FFmpeg: " + f.getAbsolutePath());
+                          return f.getAbsolutePath();
+                      }
+                  }
+                  return null;
+              }
+              public boolean start(String outputPath, int width, int height, int fps, int bitrate) {
+                  String ffmpeg = findFFmpegBinary();
+                  if (ffmpeg == null) return false;
+                  List<String> cmd = Arrays.asList(ffmpeg,
+                      "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                      "-s", width + "x" + height, "-r", String.valueOf(fps),
+                      "-i", "pipe:0", "-c:v", "libx264",
+                      "-b:v", bitrate + "k", "-pix_fmt", "yuv420p", outputPath);
+                  try {
+                      ProcessBuilder pb = new ProcessBuilder(cmd);
+                      pb.redirectErrorStream(true);
+                      ffmpegProcess = pb.start();
+                      stdin = ffmpegProcess.getOutputStream();
+                      new Thread(() -> {
+                          try (BufferedReader br = new BufferedReader(
+                                  new InputStreamReader(ffmpegProcess.getInputStream()))) {
+                              String line;
+                              while ((line = br.readLine()) != null)
+                                  System.out.println("[FFmpeg] " + line);
+                          } catch (IOException ignored) {}
+                      }).start();
+                      return true;
+                  } catch (IOException e) {
+                      System.err.println("[Flashback] Error: " + e.getMessage());
+                      return false;
+                  }
+              }
+              public void writeFrame(byte[] rgbData) throws IOException {
+                  if (stdin != null) stdin.write(rgbData);
+              }
+              public void finish() throws IOException, InterruptedException {
+                  if (stdin != null) stdin.close();
+                  if (ffmpegProcess != null) ffmpegProcess.waitFor();
+              }
+          }
+          JAVAEOF
+          echo "✅ ExternalFFmpegEncoder.java written"
+
+      - name: Remove JAVE2 and patch imports
+        run: |
+          python3 - << EOF
           import re, os, glob
 
-          # ── Step 1: JAVE2 remove ─────────────────────────────────────
           for f in ["build.gradle", "build.gradle.kts"]:
               if not os.path.exists(f): continue
               with open(f) as fp:
@@ -28,116 +94,20 @@ jobs:
               g = re.sub(r'[^\n]*ws\.schild:jave[^\n]*\n', '', g)
               with open(f, "w") as fp:
                   fp.write(g)
-              print(f"✅ JAVE2 removed from {f}")
+              print("Removed JAVE2 from " + f)
 
-          # ── Step 2: FFmpeg wrapper inject ────────────────────────────
-          wrapper_dir = "src/main/java/com/moulberry/flashback/ffmpeg"
-          os.makedirs(wrapper_dir, exist_ok=True)
-
-          wrapper_code = '''package com.moulberry.flashback.ffmpeg;
-
-import net.minecraft.client.MinecraftClient;
-import java.io.*;
-import java.nio.file.*;
-import java.util.*;
-
-public class ExternalFFmpegEncoder {
-
-    private Process ffmpegProcess;
-    private OutputStream stdin;
-
-    private static final String[] FFMPEG_PATHS = {
-        // PojavLauncher FFmpeg APK (net.kdt.pojavlaunch.ffmpeg)
-        "/data/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
-        "/data/data/net.kdt.pojavlaunch.ffmpeg/cache/ffmpeg",
-        "/sdcard/Android/data/net.kdt.pojavlaunch.ffmpeg/files/ffmpeg",
-        // Fallback paths
-        "/data/data/net.kdt.pojavlaunch/files/ffmpeg",
-        "/data/data/net.kdt.pojavlaunch.debug/files/ffmpeg",
-        "/system/bin/ffmpeg",
-        "ffmpeg"
-    };
-
-    public static String findFFmpegBinary() {
-        for (String path : FFMPEG_PATHS) {
-            File f = new File(path);
-            if (f.exists() && f.canExecute()) {
-                System.out.println("[Flashback] FFmpeg found: " + f.getAbsolutePath());
-                return f.getAbsolutePath();
-            }
-        }
-        System.err.println("[Flashback] FFmpeg not found! Install net.kdt.pojavlaunch.ffmpeg APK");
-        return null;
-    }
-
-    public boolean start(String outputPath, int width, int height, int fps, int bitrate) {
-        String ffmpeg = findFFmpegBinary();
-        if (ffmpeg == null) return false;
-
-        List<String> cmd = Arrays.asList(
-            ffmpeg,
-            "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", width + "x" + height,
-            "-r", String.valueOf(fps),
-            "-i", "pipe:0",
-            "-c:v", "libx264",
-            "-b:v", bitrate + "k",
-            "-pix_fmt", "yuv420p",
-            outputPath
-        );
-
-        try {
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);
-            ffmpegProcess = pb.start();
-            stdin = ffmpegProcess.getOutputStream();
-
-            new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(
-                        new InputStreamReader(ffmpegProcess.getInputStream()))) {
-                    String line;
-                    while ((line = br.readLine()) != null)
-                        System.out.println("[FFmpeg] " + line);
-                } catch (IOException ignored) {}
-            }).start();
-
-            return true;
-        } catch (IOException e) {
-            System.err.println("[Flashback] FFmpeg start failed: " + e.getMessage());
-            return false;
-        }
-    }
-
-    public void writeFrame(byte[] rgbData) throws IOException {
-        if (stdin != null) stdin.write(rgbData);
-    }
-
-    public void finish() throws IOException, InterruptedException {
-        if (stdin != null) stdin.close();
-        if (ffmpegProcess != null) ffmpegProcess.waitFor();
-    }
-}
-'''
-          with open(f"{wrapper_dir}/ExternalFFmpegEncoder.java", "w") as f:
-              f.write(wrapper_code)
-          print("✅ ExternalFFmpegEncoder.java created")
-
-          # ── Step 3: JAVE2 calls replace karo ────────────────────────
           for fp in glob.glob("src/main/java/**/*.java", recursive=True):
               with open(fp) as f:
                   code = f.read()
               if "jave" not in code.lower(): continue
-
               code = re.sub(
-                  r'import ws\.schild\.jave[^;]+;',
-                  'import com.moulberry.flashback.ffmpeg.ExternalFFmpegEncoder;',
+                  r"import ws\.schild\.jave[^;]+;",
+                  "import com.moulberry.flashback.ffmpeg.ExternalFFmpegEncoder;",
                   code
               )
               with open(fp, "w") as f:
                   f.write(code)
-              print(f"✅ Patched: {fp}")
+              print("Patched: " + fp)
           EOF
 
       - name: Build
