@@ -1,0 +1,63 @@
+name: Flashback x86→ARM Repack
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: moulberry/Flashback
+          ref: main
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Build normally
+        run: ./gradlew build
+
+      - name: Repack JAR — x86 libs → ARM64
+        run: |
+          JAR=$(find build/libs -name "flashback-*.jar" \
+                ! -name "*-dev*" ! -name "*-sources*" | head -1)
+
+          mkdir -p repack
+          cd repack
+          cp "../$JAR" original.jar
+
+          # JAR extract karo
+          unzip -q original.jar -d extracted
+
+          # x86 .so files dhundo aur ARM64 se replace karo
+          find extracted -name "*.so" | while read so; do
+            echo "Found native lib: $so"
+            # x86_64 → aarch64 path rename
+            arm_path="${so//x86_64/aarch64}"
+            arm_path="${arm_path//x86/aarch64}"
+            if [ "$so" != "$arm_path" ]; then
+              mkdir -p "$(dirname "$arm_path")"
+              mv "$so" "$arm_path"
+              echo "  Renamed → $arm_path"
+            fi
+          done
+
+          # JAVE2 x86 jar ke andar bhi native libs hoti hain
+          find extracted -name "*.jar" | while read innerjar; do
+            if unzip -l "$innerjar" | grep -q "x86"; then
+              echo "Inner JAR has x86 libs: $innerjar — removing"
+              rm "$innerjar"
+            fi
+          done
+
+          # Repack karo
+          cd extracted
+          zip -q -r "../../build/libs/flashback-arm64-repack.jar" .
+          echo "✅ ARM64 JAR ready"
+
+      - name: Upload ARM64 JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashback-arm64-repack
+          path: build/libs/flashback-arm64-repack.jar
